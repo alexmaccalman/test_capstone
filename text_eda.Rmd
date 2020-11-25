@@ -1,0 +1,430 @@
+---
+title: "text_EDA"
+author: "Alex MacCalman"
+date: "11/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(LaF)
+library(tidytext)
+library(stringr)
+library(sentimentr)
+library(tidyverse)
+library(tm)
+```
+## Import and build corpus
+```{r}
+twit <- as_tibble(read_lines("en_US.twitter.txt"))
+blog <- as_tibble(read_lines("en_US.blogs.txt"))
+news <- as_tibble(read_lines("en_US.news.txt"))
+
+# find the line with the most words in the data sets
+max(str_count(total_twit, "\\S+"))
+max(str_count(total_blog, "\\S+"))
+max(str_count(total_news, "\\S+"))
+# find the line with the most characters in the data set
+max(nchar(total_twit))
+max(nchar(total_blog))
+max(nchar(total_news))
+
+total_twit <- tolower(total_twit)
+# divide the number of "love" word by the number of "hate" words
+love_hate <- sum(str_count(total_twit, "love")) / sum(str_count(total_twit, "hate"))
+# find which line has the word "biostats" to see what the line says
+total_twit[str_which(total_twit, "biostats")]
+# find out how many times a sting is in the twitter data (note, reload data so that they are nbot all lowercase)
+sum(str_detect(total_twit, "A computer once beat me at chess, but it was no match for me at kickboxing"))
+
+
+
+set.seed(123)
+twit <- as_tibble(sample_lines("en_US.twitter.txt", 5000)) # sample a set of lines to work with
+blog <- as_tibble(sample_lines("en_US.blogs.txt", 5000))
+news <- as_tibble(sample_lines("en_US.news.txt", 5000))
+# all <- list(c(blog, news, twit))
+
+corpus <- rbind(twit, blog, news)
+
+```
+## Clean the corpus  
+```{r}
+# tokenizes into sentences, stips punctuation, converts to lowercase
+corpus <- corpus %>% 
+  unnest_tokens(sentance, value, token = "sentences", to_lower = TRUE, strip_punct = TRUE)
+# remove non-ascii characters
+corpus$sentance <- gsub("[^\x20-\x7E]", "", corpus$sentance)
+# merge multiple saces to a single space and remove trailing/leading spaces
+corpus$sentance <- str_replace(gsub("\\s+", " ", str_trim(corpus$sentance)), "B", "b")
+# removes URLs
+corpus$sentance <- gsub(" ?(f|ht)tp(s?)://(.*)[.][a-z]+", "", corpus$sentance)
+# add START and END words to each sentence
+corpus$sentance <- paste0("START", " ", corpus$sentance, " ", "END")
+# eliminate numbers
+corpus$sentance <- gsub('[[:digit:]]+', '', corpus$sentance)
+
+# create a token list
+tokens <- corpus %>% 
+  unnest_tokens(word, sentance, to_lower = FALSE)
+
+# eliminate the profanity words
+# download Google's bad word list 
+bad_words <- read_tsv("https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/badwordslist/badwords.txt", col_names = FALSE)
+bad_words <- as_tibble(bad_words) %>% 
+  rename(word = X1)
+tokens <- tokens %>%
+  anti_join(bad_words)
+
+```
+## Create n-grams  
+```{r}
+unigram <- tokens %>% 
+  count(word, sort = TRUE)
+
+bigram <- tokens %>% 
+  unnest_tokens(bigram, word, token = "ngrams", n = 2, to_lower = FALSE) %>% 
+  count(bigram, sort = TRUE) %>%
+  filter(n > 4) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+trigram <- tokens %>% 
+  unnest_tokens(trigram, word, token = "ngrams", n = 3, to_lower = FALSE) %>% 
+  count(trigram, sort = TRUE) %>% 
+  filter(n > 4) %>% 
+  separate(trigram, c("word1", "word2", "word3"), sep = " ")
+
+
+```
+
+Test model  
+```{r}
+
+trigram_fun <- function(pre_word_df, discount1, discount2){
+  
+  # 3 calculate probabilities of words completing observed trigrams
+  
+  # count of bigram word
+  count_word <- bigram %>% 
+    filter(word1 == pre_word_df$word1 & word2 == pre_word_df$word2)
+  bigram_count <- count_word$n
+  
+  # create the observed trigram table
+  obs_tri <- trigram %>% 
+    filter(word1 == pre_word_df$word1 & word2 == pre_word_df$word2)  %>% 
+    mutate(prob = (n - discount1) / bigram_count)
+  
+  # 4 calculate probabilities of words completing unobserved trigrams
+  
+  # 4.1 Find the words that complete the unobserved trigrams
+  obs_tri_tails <- obs_tri$word3 # grabs the last word
+  unobs_tri_tails <- unigram[!(unigram$word %in% obs_tri_tails),]$word
+  
+  
+  # 4.2 Calculate discounted probability mass at the bigram level, alpha1
+  
+  pre_word2 <- pre_word_df$word2 # second word of the bigram prefix
+  pre_word2_df <- unigram[unigram$word == pre_word2,] # single row of word and its count
+  
+  pre_word_bigram <- bigram[bigram$word1 == pre_word2,] # get all bigrams that start with the pre-word (unigram)
+  
+  # calcualte the alpha value
+  alpha_bi <- 0
+  if (nrow(pre_word_bigram) > 0){
+    alpha_bi <- 1 - (sum(pre_word_bigram$n - discount1) / pre_word2_df$n)
+  }
+  
+  # 4.3 Calculate the back off probability for bigrams
+  
+  pre_word2 # second word of the bigram prefix
+  unobs_tri_tails # the words that complete the unobserved trigrams
+  
+  bo_bigrams <- paste(pre_word2, unobs_tri_tails, sep = " ") # get back off bigrams
+  
+  # unite the bigrams so there is one bigram column
+  bigrams_united <- bigram %>% 
+    unite(bigram, word1, word2, sep = " ")
+  # get the observed back off bigrams
+  obs_bo_bigrams <- bigram[bigrams_united$bigram %in% bo_bigrams, ]
+  
+  # unite the obs_bo_bigrams so there is one bigram column
+  obs_bo_bigrams_united <- obs_bo_bigrams %>% 
+    unite(bigram, word1, word2, sep = " ")
+  
+  # get the unobserved back off bigrams
+  unobs_bo_bigrams <- bo_bigrams[!(bo_bigrams %in% obs_bo_bigrams_united$bigram)]
+  
+  # calculate the observed bigram probability
+  first_word <- obs_bo_bigrams$word1
+  first_word_n <- unigram[unigram$word %in% first_word, ]
+  # calcualte the observed bigram probability
+  prob_obs_bigram <- (obs_bo_bigrams$n - discount2) / first_word_n$n
+  # create a table with bigram and prop
+  prob_obs_bigram <- data.frame(bigram = obs_bo_bigrams_united$bigram, prob = prob_obs_bigram)
+  
+  # distribute discounted bigram probability mass to unobserved bigrams in proportion to unigram
+  
+  # get the unobserved bigram tails
+  prob_unobs_bigram <- str_split_fixed(unobs_bo_bigrams, " ", 2)[ ,2]
+  # make a table of unobserved tails
+  prob_unobs_bigram <- unigram[unigram$word %in% prob_unobs_bigram, ]
+  # convert counts to probabilities
+  prob_unobs_bigram <- data.frame(bigram = unobs_bo_bigrams,
+                                  prob = alpha_bi * prob_unobs_bigram$n / sum(prob_unobs_bigram$n))
+  # add the prop observed bigram to data frame
+  prob_bigram <- rbind(prob_obs_bigram, prob_unobs_bigram)
+  
+  
+  #check 
+  unobs <- prob_bigram[-1,] # take away the observed bigram
+  sum(unobs$prob)
+  
+  # 4.4 Calculate discout probability mass at the trigram level
+  
+  ## Calculate the total probability mass discounted from all observed trigrams.
+  ## This is the amount of probability mass which is
+  ## redistributed to UNOBSERVED trigrams. If no trigrams starting with the bigram
+  ## exist, alpha_tri = 1 
+  
+  big <- bigram %>% 
+    filter(bigram$word1 == pre_word_df$word1 & bigram$word2 == pre_word_df$word2)
+  
+  
+  alpha_tri <- 1
+  if (nrow(obs_tri) > 0){
+    alpha_tri <- 1 - (sum(obs_tri$n - discount2) / big$n[1])
+  }
+  
+  # 4.5 Calculate unobserved trigram probabilities
+  
+  prob_bigram <- prob_bigram %>% 
+    arrange(desc(prob_bigram$prob)) # sort the table
+  
+  sum_prob_bo_bigrams <- sum(prob_bigram$prob)
+  first_pre_word <- pre_word_df$word1
+  unobs_tri <- paste(first_pre_word, prob_bigram$bigram, sep = " ")
+  prob_unobs_tri <- alpha_tri * prob_bigram$prob / sum_prob_bo_bigrams
+  unobs_tri_df <- data.frame(trigram = unobs_tri, prob = prob_unobs_tri)
+  
+  # 5 Select word with the highest probability
+  # unite this and rbind with prob_unobs_tri
+  obs_tri 
+  obs_tri_df <- obs_tri %>% 
+    unite(trigram, word1, word2, word3, sep = " ") %>% 
+    select(trigram, prob)
+  
+  prob_trigram <- rbind(obs_tri_df, unobs_tri_df)
+  prob_trigram
+}
+
+# 1.2 Select bigram and trigram discounts
+discount1 <- 0.5
+discount2 <- 0.5
+# 2 Select bigram prefix of word to be predicted
+
+phrase_input <- "happy new" 
+phrase_input <- str_trim(phrase_input, side = "both") #trim white spaces on both sides
+
+if (str_count(phrase_input, "\\w+") <= 1){
+  phrase_input <- paste0("notAword", " ", phrase_input)
+}
+
+pre_words <- word(phrase_input, -2, -1) # grab trhe last two word in the input phrase
+
+
+
+
+#create tibble for word input
+pre_word_df <- tibble(line = 1, text = pre_words)%>% 
+  unnest_tokens(bigram, text, token = "ngrams", n = 2) %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+
+
+top_amount <- 10
+# is the last word in the unigram model?
+if (sum(unigram$word %>% str_detect(pre_word_df$word2)) > 0){ 
+result <- trigram_fun(pre_word_df, discount1, discount2) %>% 
+  separate(trigram, c("word1", "word2", "word3"), sep = " ") %>% 
+  arrange(desc(prob)) %>% 
+  select(word3, prob) %>% 
+  rename(word = word3) %>% 
+  filter(word != "END", word != "START") %>% 
+  head(top_amount)
+}else{
+  result <- unigram %>% 
+    filter(word != "END", word != "START") %>% 
+    mutate(prob = n / sum(n)) %>% 
+    select(word, prob) %>% 
+    arrange(desc(prob)) %>% 
+    head(top_amount)
+}
+result
+```
+
+
+
+
+
+
+
+
+Visualize the word tokens  
+```{r}
+# visualze 
+combined %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 200) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  xlab(NULL) +
+  coord_flip()
+
+# most frequent words
+combined %>% 
+  group_by(source) %>% 
+  count(word, sort = TRUE)
+
+
+```
+## Calculate Term frequency
+```{r}
+# Examine first term frequency. WCalcualte the total words in each source
+source_words <- combined %>% 
+  count(source, word, sort = TRUE)
+
+total_words <- source_words %>% 
+  group_by(source) %>% 
+  summarize(total = sum(n))
+
+source_words <- left_join(source_words, total_words) # this operation joins the totals to the tibble
+
+# the number of times a word appears in a source divided by the total number of terms (words) in that source.
+ggplot(source_words, aes(n/total, fill = source)) +
+  geom_histogram(show.legend = FALSE) +
+  xlim(NA, 0.0009) + # narrow in on range
+  facet_wrap(~source, ncol = 2)
+
+```
+Our frequency plots show long tails which are typical in languages. 
+## Important words  
+Now we find the important words for the content of each source by decreasing the weight for commonly used words and increasing the weight for words that are not used very much the sources (twitter, blog, news).  
+```{r}
+# find important words with tf_idf
+source_tf_idf <- source_words %>%
+  bind_tf_idf(word, source, n)
+
+# arrange
+source_tf_idf %>%
+  select(-total) %>%
+  arrange(desc(tf_idf))
+```
+Now let's visualize the high tf_idf words.  tf-idf identifies words that are important to one document within a collection of documents, in this case, sources.  
+```{r}
+source_tf_idf %>%
+  group_by(source) %>%
+  slice_max(tf_idf, n = 30) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = source)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~source, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL)
+```
+## n-grams
+
+Eliminate characters
+```{r}
+# First we should eliminate the characters we don't wont from the original data set
+
+remove_chr <- function(source){
+  regex <- "â | ðÿ"
+  source <- stringi::stri_replace_all_regex(source, regex, "")
+  # remove all digits, punctuation, and symbols
+  source <- stringi::stri_replace_all_regex(source, "\\d | [\\p{p}\\p{S}]", "")
+}
+
+twit <- remove_chr(twit)
+blog <- remove_chr(blog)
+news <- remove_chr(news)
+
+sum(str_detect(blog, "ðÿ"))
+```
+Create bigrams  
+```{r}
+# create a combined table with line number and source for bigrams
+twit_bi <- as_tibble(twit) %>%
+  unnest_tokens(bigram, value, token = "ngrams", n = 2) %>% #value is the character column header
+  mutate(source = "twitter")
+
+blog_bi <- as_tibble(blog) %>% 
+  unnest_tokens(bigram, value, token = "ngrams", n = 2) %>%  #value is the character column header
+  mutate(source = "blogs")
+news_bi <- as_tibble(news) %>% 
+  unnest_tokens(bigram, value, token = "ngrams", n = 2) %>%  #value is the character column header
+  mutate(source = "news")
+
+bi_combo <- rbind(twit_bi, blog_bi, news_bi)
+
+
+```
+
+Examine most common bigrams  
+```{r}
+# examine the most common bigram
+bi_combo %>%
+  count(source, bigram, sort = TRUE)
+
+#eliminate stop words
+data(stop_words)
+bigrams_separated <- bi_combo %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+bigrams_filtered <- bigrams_separated %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word)
+
+# new bigram counts:
+bigram_counts <- bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE)
+
+```
+Create trigrams  
+```{r}
+# create a combined table with line number and source for bigrams
+twit_tri <- as_tibble(twit) %>%
+  unnest_tokens(trigram, value, token = "ngrams", n = 3) %>% #value is the character column header
+  mutate(source = "twitter")
+
+blog_tri <- as_tibble(blog) %>% 
+  unnest_tokens(trigram, value, token = "ngrams", n = 3) %>%  #value is the character column header
+  mutate(source = "blogs")
+news_tri <- as_tibble(news) %>% 
+  unnest_tokens(trigram, value, token = "ngrams", n = 3) %>%  #value is the character column header
+  mutate(source = "news")
+
+tri_combo <- rbind(twit_tri, blog_tri, news_tri)
+```
+
+Examine most common trigrams  
+```{r}
+# examine the most common bigram
+tri_combo %>%
+  count(source, trigram, sort = TRUE)
+
+#eliminate stop words
+data(stop_words)
+trigrams_separated <- tri_combo %>%
+  separate(trigram, c("word1", "word2", "word3"), sep = " ")
+
+trigrams_filtered <- trigrams_separated %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word) %>% 
+  filter(!word3 %in% stop_words$word)
+
+# new bigram counts:
+trigram_counts <- trigrams_filtered %>% 
+  count(word1, word2, word3, sort = TRUE)
+
+```
+
