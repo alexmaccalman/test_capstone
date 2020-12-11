@@ -1,0 +1,195 @@
+---
+title: "Predict_word"
+author: "Alex MacCalman"
+date: "11/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(LaF)
+library(tidytext)
+library(stringr)
+#library(sentimentr)
+library(tidyverse)
+#library(tm)
+```
+ 
+## Sample a collection of the data    
+```{r}
+set.seed(123)
+sample_amount <- 500000
+filter4 <- TRUE
+twit <- as_tibble(sample_lines("en_US.twitter.txt", sample_amount)) # sample a set of lines to work with
+blog <- as_tibble(sample_lines("en_US.blogs.txt", sample_amount))
+news <- as_tibble(sample_lines("en_US.news.txt", sample_amount))
+# all <- list(c(blog, news, twit))
+
+corpus <- rbind(twit, blog, news)
+
+```
+To create a corpus, we will perform the follwoing cleaning steps:
+1. token into sentences using tidytext package, strip punctuation, and cast all word to lower case.  
+2. remove all non-ASCII characters.
+3. merge multiple spaces to a single space and remove trailing/leading spaces.
+4. remove URLs.
+5. eliminate numbers.
+6. remove profanity words.  
+## Clean the corpus  
+```{r}
+# tokenizes into sentences, stips punctuation, converts to lowercase
+corpus <- corpus %>% 
+  unnest_tokens(sentance, value, token = "sentences", to_lower = TRUE)
+# remove punctuation except apostrophes
+corpus$sentance <- gsub("[^'[:^punct:]]", "", corpus$sentance, perl=T)
+# remove apostrophes without creating a space
+corpus$sentance <- gsub("'", "", corpus$sentance)
+# remove non-ascii characters
+corpus$sentance <- gsub("[^\x20-\x7E]", "", corpus$sentance)
+# merge multiple spaces to a single space and remove trailing/leading spaces
+corpus$sentance <- str_replace(gsub("\\s+", " ", str_trim(corpus$sentance)), "B", "b")
+# removes URLs
+corpus$sentance <- gsub(" ?(f|ht)tp(s?)://(.*)[.][a-z]+", "", corpus$sentance)
+# eliminate numbers
+corpus$sentance <- gsub('[[:digit:]]+', '', corpus$sentance)
+
+
+# create a token list
+tokens <- corpus %>% 
+  unnest_tokens(word, sentance, to_lower = FALSE)
+
+# eliminate the profanity words
+# download Google's bad word list 
+bad_words <- read_tsv("https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/badwordslist/badwords.txt", col_names = FALSE)
+bad_words <- as_tibble(bad_words) %>% 
+  rename(word = X1)
+tokens <- tokens %>%
+  anti_join(bad_words)
+
+```
+## Create n-grams and save a list of ngrams 
+We now will create unigrams, bigrams and trigrams.  
+```{r}
+start_time <- Sys.time()
+unigram <- tokens %>% 
+  count(word, sort = TRUE) 
+
+bigram <- tokens %>% 
+  unnest_tokens(bigram, word, token = "ngrams", n = 2, to_lower = FALSE) %>% 
+  count(bigram, sort = TRUE) 
+
+trigram <- tokens %>% 
+  unnest_tokens(trigram, word, token = "ngrams", n = 3, to_lower = FALSE) %>% 
+  count(trigram, sort = TRUE)
+ 
+fourgram <- tokens %>% 
+  unnest_tokens(fourgram, word, token = "ngrams", n = 4, to_lower = FALSE) %>% 
+  count(fourgram, sort = TRUE)  
+
+fivegram <- tokens %>% 
+  unnest_tokens(fivegram, word, token = "ngrams", n = 5, to_lower = FALSE) %>% 
+  count(fivegram, sort = TRUE) 
+
+# filter counts
+if(filter4){
+  unigram <- unigram %>% 
+    filter(n > 2)
+  bigram <- bigram %>% 
+    filter(n > 2)
+  trigram <- trigram %>% 
+    filter(n > 2)
+  fourgram <- fourgram %>% 
+    filter(n > 2)
+  fivegram <- fivegram %>% 
+    filter(n > 2)
+}
+end_time <- Sys.time()
+end_time - start_time
+```
+
+
+## Precompute the stupid backoff scores for each n-gram table
+```{r}
+start_time <- Sys.time()
+last_word <- function(gram){
+  word(gram, -1)
+}
+
+# preprocess the 5-gram table
+lower_4gram <- function(gram){
+  word(gram, -5, -2)
+}
+high5gram <- fivegram$fivegram
+data5 <- fivegram %>% 
+  mutate(fourgram = map_chr(high5gram, lower_4gram),
+         last = map_chr(high5gram, last_word)) %>% 
+  rename(five_n = n) %>% 
+  left_join(fourgram) %>% 
+  rename(four_n = n) %>% 
+  mutate(score = five_n / four_n) %>% 
+  select(fourgram, last, score)
+
+# preprocess the 4-gram table
+lower_3gram <- function(gram){
+  word(gram, -4, -2)
+}
+high4gram <- fourgram$fourgram
+data4 <- fourgram %>% 
+  mutate(trigram = map_chr(high4gram, lower_3gram),
+         last = map_chr(high4gram, last_word)) %>% 
+  rename(four_n = n) %>% 
+  left_join(trigram) %>% 
+  rename(tri_n = n) %>% 
+  mutate(score = 0.4 * four_n / tri_n) %>% 
+  select(trigram, last, score)
+
+# preprocess the 3-gram table
+lower_2gram <- function(gram){
+  word(gram, -3, -2)
+}
+high3gram <- trigram$trigram
+data3 <- trigram %>% 
+  mutate(bigram = map_chr(high3gram, lower_2gram),
+         last = map_chr(high3gram, last_word)) %>% 
+  rename(tri_n = n) %>% 
+  left_join(bigram) %>% 
+  rename(bi_n = n) %>% 
+  mutate(score = 0.4 * 0.4 * tri_n / bi_n) %>% 
+  select(bigram, last, score)
+
+# preprocess the 2-gram table
+lower_1gram <- function(gram){
+  word(gram, -2)
+}
+high2gram <- bigram$bigram
+data2 <- bigram %>% 
+  mutate(word = map_chr(high2gram, lower_1gram),
+         last = map_chr(high2gram, last_word)) %>% 
+  rename(bi_n = n) %>% 
+  left_join(unigram) %>% 
+  rename(uni_n = n) %>% 
+  mutate(score = 0.4 * 0.4 * 0.4 * bi_n / uni_n) %>% 
+  select(word, last, score)
+
+top_unigrams <- head(unigram, 5) %>% 
+  mutate(score = 0) %>% 
+  rename(last = word) %>% 
+  select(-n)
+
+end_time <- Sys.time()
+end_time - start_time
+```
+
+## histrogram of data objects
+```{r}
+# data4 %>% 
+#   ggplot(aes(x = score)) +
+#   geom_histogram()
+```
+
+## Save objects  
+```{r}
+all_data <- list(data5, data4, data3, data2, top_unigrams)
+saveRDS(all_data, "predict.rds")
+gc() # garbage clean to free up memory
+```
